@@ -1,0 +1,1010 @@
+--!strict
+--!native
+--!optimize 2
+
+-------------------------------------------------------------------------------------------------------------
+--#########################################################################################################--
+-------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------
+-- DependentServices Configuration Section
+----------------------------------------------------------
+
+local IGNORED_KEYS : { [string]: boolean } = {
+	["__persistentBase"] = true, -- internal snapshot key excluded from serialization
+	["__cacheBase"]      = true, -- internal cache baseline key excluded from serialization
+	["__dirty"]          = true, -- dirty flag excluded from serialization
+	["__retries"]        = true, -- retry counter excluded from serialization
+	["__failedHistory"]  = true, -- failure flag excluded from serialization
+}
+
+local POOL_SIZE    : number = 1000                                                               -- maximum number of recycled tables held in the pool
+local BASE64_CHARS : string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" -- Base64 character table
+
+-------------------------------------------------------------------------------------------------------------
+--#########################################################################################################--
+-------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------
+-- DependentServices Type Structures Section
+----------------------------------------------------------
+
+export type MessagePayload = {
+	PlayerUserID : number?,
+	Data         : { PlayerUserID: number?, [string]: any }?,
+	[string]     : any,
+}
+
+export type SubscriptionConnection = {
+	Disconnect : (self: SubscriptionConnection) -> (),
+}
+
+export type MessagingInterface = {
+	RelayStream  : (topic: string, message: MessagePayload) -> boolean,
+	ListenStream : (topic: string, callbackFunction: (messageObject: MessagePayload) -> ()) -> SubscriptionConnection?,
+}
+
+type SerializedVector3      = { __type: "Vector3",      b64: string }
+type SerializedVector2      = { __type: "Vector2",      b64: string }
+type SerializedVector3int16 = { __type: "Vector3int16", b64: string }
+type SerializedCFrame       = { __type: "CFrame",       b64: string }
+type SerializedUDim         = { __type: "UDim",         b64: string }
+type SerializedUDim2        = { __type: "UDim2",        b64: string }
+type SerializedRect         = { __type: "Rect",         b64: string }
+type SerializedColor3       = { __type: "Color3",       b64: string }
+type SerializedBrickColor   = { __type: "BrickColor",   Name: string }
+
+type SerializedColorSequence = {
+	__type    : "ColorSequence",
+	Keypoints : { { Time: number, Value: { number } } },
+}
+
+type SerializedNumberSequence = {
+	__type    : "NumberSequence",
+	Keypoints : { { Time: number, Value: number, Envelope: number } },
+}
+
+type SerializedFont = {
+	__type : "Font",
+	Family : string,
+	Weight : string,
+	Style  : string,
+}
+
+type SerializedPhysicalProperties = {
+	__type           : "PhysicalProperties",
+	Density          : number,
+	Friction         : number,
+	Elasticity       : number,
+	FrictionWeight   : number,
+	ElasticityWeight : number,
+}
+
+type SerializedRaycastParams = {
+	__type         : "RaycastParams",
+	FilterType     : string,
+	IgnoreWater    : boolean,
+	CollisionGroup : string,
+	FilterNames    : { string },
+}
+
+type SerializedOverlapParams = {
+	__type         : "OverlapParams",
+	FilterType     : string,
+	MaxParts       : number,
+	CollisionGroup : string,
+	FilterNames    : { string },
+}
+
+type SerializedPathWaypoint = {
+	__type   : "PathWaypoint",
+	Position : SerializedVector3,
+	Action   : string,
+}
+
+type SerializedEnumItem = {
+	__type: "EnumItem",
+	Value: string,
+}
+
+type SerializedDateTime = {
+	__type        : "DateTime",
+	UnixTimestamp : number,
+}
+
+type SerializedInstance = {
+	__type    : "Instance",
+	Name      : string,
+	ClassName : string,
+}
+
+type SerializedTweenInfo = {
+	__type          : "TweenInfo",
+	Time            : number,
+	EasingStyle     : string,
+	EasingDirection : string,
+	RepeatCount     : number,
+	Reverses        : boolean,
+	DelayTime       : number,
+}
+
+type SerializedValue =
+	SerializedVector3 | SerializedVector2 | SerializedVector3int16 | SerializedCFrame
+| SerializedUDim | SerializedUDim2 | SerializedRect | SerializedColor3
+| SerializedBrickColor | SerializedColorSequence | SerializedNumberSequence
+| SerializedFont | SerializedPhysicalProperties | SerializedRaycastParams
+| SerializedOverlapParams | SerializedPathWaypoint | SerializedEnumItem
+| SerializedTweenInfo | SerializedDateTime | SerializedInstance
+| string | number | boolean | { [any]: SerializedValue }
+
+type DataTable             = { [any]: any }
+type VisitedTable          = { [DataTable]: boolean }
+type TablePool             = { DataTable }
+type CooldownMap           = { [string]: number }
+type DeltaChanges          = DataTable | nil
+type SerializationCacheEntry = {
+	cachedData     : DataTable,
+	serializedData : DataTable,
+	[string]       : any,
+}
+
+-------------------------------------------------------------------------------------------------------------
+--#########################################################################################################--
+-------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------
+-- DependentServices Imported Services Section
+----------------------------------------------------------
+
+local CollectionService = game:GetService("CollectionService")
+local PlayersService    = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local HttpService       = game:GetService("HttpService")
+
+-------------------------------------------------------------------------------------------------------------
+--#########################################################################################################--
+-------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------
+-- DependentServices Internal States Section
+----------------------------------------------------------
+
+local DependentServices = {
+	Players   = PlayersService,
+	Run       = RunService,
+	Http      = HttpService,
+	Messaging = nil :: MessagingInterface?,
+}
+
+local Scheduler = {
+	Spawn  = task.spawn,
+	Defer  = task.defer,
+	Delay  = task.delay,
+	Wait   = task.wait,
+	Cancel = task.cancel,
+}
+
+local MessageCooldowns        : CooldownMap                           = {}
+local SerializationCacheStore : { [string]: SerializationCacheEntry } = {}
+local CacheCount              : number                                = 0
+local PooledTables            : TablePool                             = {}
+local Base64Lookup            : { [number]: number }                  = {}
+
+for CharIndex = 1, 64 do
+	local ByteValue         = string.byte(BASE64_CHARS, CharIndex, CharIndex)
+	Base64Lookup[ByteValue] = CharIndex - 1
+end
+
+DependentServices.Messaging = {
+	RelayStream = function(Topic: string, Message: MessagePayload): boolean
+		local MessagingService       = game:GetService("MessagingService")
+		local PlayerUserId : number? = Message.PlayerUserID
+
+		if not PlayerUserId and Message.Data then
+			PlayerUserId = Message.Data.PlayerUserID
+		end
+
+		local PlayerIdString = if PlayerUserId then tostring(PlayerUserId) else ""
+		local CooldownKey    = Topic .. "_" .. PlayerIdString
+		local LastSendTime   = MessageCooldowns[CooldownKey]
+
+		if LastSendTime and (os.time() - LastSendTime) < 2 then
+			return false
+		end
+
+		MessageCooldowns[CooldownKey] = os.time()
+
+		local PublishSuccess, PublishError = pcall(function(): boolean?
+			MessagingService:PublishAsync(Topic, Message)
+			return nil
+		end)
+
+		if not PublishSuccess then
+			warn("[RelayStream] Failed to publish:", PublishError)
+		end
+
+		return PublishSuccess
+	end,
+
+	ListenStream = function(Topic: string, CallbackFunction: (messageObject: MessagePayload) -> ()): SubscriptionConnection?
+		local MessagingService = game:GetService("MessagingService")
+
+		if not CallbackFunction then
+			return nil
+		end
+
+		local SubscribeSuccess, SubscribeResult = pcall(function()
+			return MessagingService:SubscribeAsync(Topic, CallbackFunction)
+		end)
+
+		if SubscribeSuccess then
+			return SubscribeResult :: SubscriptionConnection
+		else
+			warn("[ListenStream] Failed to subscribe:", SubscribeResult)
+			return nil
+		end
+	end,
+} :: MessagingInterface
+
+-------------------------------------------------------------------------------------------------------------
+--#########################################################################################################--
+-------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------
+-- DependentServices Local Function Section
+----------------------------------------------------------
+
+-- Creates a deep clone of a value for serialization cache storage, skipping metadata keys.
+local function deepCloneForCache(Value: any, Visited: { [any]: boolean }?): any
+	Visited = Visited or {}
+	local ValueType = typeof(Value)
+
+	if ValueType == "Instance" then
+		return string.format("[Instance:%s]", (Value :: Instance).Name or "?")
+	end
+
+	if type(Value) ~= "table" then
+		return Value
+	end
+
+	if Visited and Visited[Value] then
+		return nil
+	end
+
+	Visited[Value] = true
+	local Copy: { [any]: any } = {}
+
+	for Key, Child in Value do
+		if not IGNORED_KEYS[Key :: string] then
+			Copy[Key] = deepCloneForCache(Child, Visited)
+		end
+	end
+
+	return Copy
+end
+
+-- Acquires a recycled table from the pool, or allocates a fresh one if the pool is empty.
+local function acquireTableFromPool(): DataTable
+	local PooledTable = table.remove(PooledTables)
+
+	if PooledTable then
+		return PooledTable
+	end
+
+	return {}
+end
+
+-- Clears and returns a table to the pool if the pool has not reached its size limit.
+local function releaseTableToPool(Target: DataTable): ()
+	if #PooledTables < POOL_SIZE then
+		table.clear(Target)
+		table.insert(PooledTables, Target)
+	end
+end
+
+-- Recursively releases a delta tree back into the table pool.
+local function recursiveReleaseToPool(TargetTable: DataTable): ()
+	for _, Value in TargetTable do
+		if type(Value) == "table" and Value.__type == nil then
+			recursiveReleaseToPool(Value)
+		end
+	end
+
+	releaseTableToPool(TargetTable)
+end
+
+-- Builds the composite string key used to look up a serialization cache entry.
+local function generateCacheKey(MemoryLocation: string, UserId: string): string
+	return MemoryLocation .. "_" .. UserId
+end
+
+-- Recursively compares CurrentData against CachedData and returns a delta table of changes, or nil if identical.
+local function detectChangedFields(CurrentData: any, CachedData: any, VisitedTables: VisitedTable?): DeltaChanges
+	local Visited: VisitedTable = VisitedTables or {}
+
+	if typeof(CurrentData) ~= "table" or typeof(CachedData) ~= "table" then
+		if CurrentData ~= CachedData then
+			return CurrentData
+		end
+
+		return nil
+	end
+
+	if Visited[CurrentData] then
+		return nil
+	end
+	Visited[CurrentData] = true
+
+	local Changes    : DataTable = acquireTableFromPool()
+	local HasChanges : boolean   = false
+
+	for FieldKey: any, FieldValue: any in CurrentData do
+		if IGNORED_KEYS[FieldKey :: string] then
+			continue
+		end
+
+		local CachedFieldValue: any = CachedData[FieldKey]
+
+		if CachedFieldValue == nil then
+			Changes[FieldKey] = FieldValue
+			HasChanges        = true
+
+		elseif typeof(FieldValue) == "table" then
+			local NestedChanges: DeltaChanges = detectChangedFields(FieldValue, CachedFieldValue, Visited)
+
+			if NestedChanges ~= nil then
+				Changes[FieldKey] = NestedChanges
+				HasChanges        = true
+			end
+
+		elseif FieldValue ~= CachedFieldValue then
+			Changes[FieldKey] = FieldValue
+			HasChanges        = true
+		end
+	end
+
+	for CachedKey: any in CachedData do
+		if IGNORED_KEYS[CachedKey :: string] then
+			continue
+		end
+
+		if CurrentData[CachedKey] == nil then
+			Changes[CachedKey] = "__DELETED__"
+			HasChanges         = true
+		end
+	end
+
+	if HasChanges then
+		return Changes
+	end
+
+	releaseTableToPool(Changes)
+	return nil
+end
+
+-- Encodes raw buffer bytes into a Base64 string using the module-level character table.
+local function encodeBufferToBase64(BufferData: buffer): string
+	local BufferLength : number     = buffer.len(BufferData)
+	local ResultChunks : { string } = acquireTableFromPool()
+
+	for ByteIndex = 0, BufferLength - 1, 3 do
+		local Byte1    = buffer.readu8(BufferData, ByteIndex)
+		local Byte2    = if (ByteIndex + 1 < BufferLength) then buffer.readu8(BufferData, ByteIndex + 1) else 0
+		local Byte3    = if (ByteIndex + 2 < BufferLength) then buffer.readu8(BufferData, ByteIndex + 2) else 0
+		local Combined = bit32.bor(bit32.lshift(Byte1, 16), bit32.lshift(Byte2, 8), Byte3)
+		local C1       = bit32.rshift(Combined, 18) % 64 + 1
+		local C2       = bit32.rshift(Combined, 12) % 64 + 1
+
+		table.insert(ResultChunks, string.sub(BASE64_CHARS, C1, C1))
+		table.insert(ResultChunks, string.sub(BASE64_CHARS, C2, C2))
+
+		if ByteIndex + 1 < BufferLength then
+			local C3 = bit32.rshift(Combined, 6) % 64 + 1
+			table.insert(ResultChunks, string.sub(BASE64_CHARS, C3, C3))
+		else
+			table.insert(ResultChunks, "=")
+		end
+
+		if ByteIndex + 2 < BufferLength then
+			local C4 = Combined % 64 + 1
+			table.insert(ResultChunks, string.sub(BASE64_CHARS, C4, C4))
+		else
+			table.insert(ResultChunks, "=")
+		end
+	end
+
+	local EncodedString = table.concat(ResultChunks)
+	releaseTableToPool(ResultChunks)
+	return EncodedString
+end
+
+-- Decodes a Base64 string back into a raw buffer.
+local function decodeBase64ToBuffer(EncodedString: string): buffer
+	local Cleaned      = string.gsub(EncodedString, "=", "")
+	local StringLength = #Cleaned
+	local BufferLength = math.floor(StringLength * 3 / 4)
+	local ResultBuffer = buffer.create(BufferLength)
+	local BufferIndex  = 0
+
+	for CharIndex = 1, StringLength, 4 do
+		local B1 = string.byte(Cleaned, CharIndex)
+		local B2 = if CharIndex + 1 <= StringLength then string.byte(Cleaned, CharIndex + 1) else 0
+		local B3 = if CharIndex + 2 <= StringLength then string.byte(Cleaned, CharIndex + 2) else 0
+		local B4 = if CharIndex + 3 <= StringLength then string.byte(Cleaned, CharIndex + 3) else 0
+
+		local V1 = Base64Lookup[B1] or 0
+		local V2 = Base64Lookup[B2] or 0
+		local V3 = Base64Lookup[B3] or 0
+		local V4 = Base64Lookup[B4] or 0
+
+		buffer.writeu8(ResultBuffer, BufferIndex, bit32.bor(bit32.lshift(V1, 2), bit32.rshift(V2, 4)))
+
+		if CharIndex + 2 <= StringLength then
+			buffer.writeu8(ResultBuffer, BufferIndex + 1, bit32.bor(bit32.lshift(bit32.band(V2, 0x0F), 4), bit32.rshift(V3, 2)))
+		end
+
+		if CharIndex + 3 <= StringLength then
+			buffer.writeu8(ResultBuffer, BufferIndex + 2, bit32.bor(bit32.lshift(bit32.band(V3, 0x03), 6), V4))
+		end
+
+		BufferIndex += 3
+	end
+
+	return ResultBuffer
+end
+
+-- Searches workspace and ReplicatedStorage for instances matching each name in the list.
+local function findInstancesByNames(InstanceNames: { string }): { Instance }
+	local Found: { Instance } = {}
+
+	for _, Name in ipairs(InstanceNames or {}) do
+		local WorkspaceInstance = workspace:FindFirstChild(Name, true)
+		local StorageInstance   = game.ReplicatedStorage:FindFirstChild(Name, true)
+		local FoundInstance     = WorkspaceInstance or StorageInstance
+
+		if FoundInstance then
+			table.insert(Found, FoundInstance)
+		end
+	end
+
+	return Found
+end
+
+-- Falls back to CollectionService tag scanning when named-instance lookup returns nothing.
+local function getTaggedInstancesFallback(): { Instance }
+	local TagPriority : { string }   = { "WorldGeometry", "RaycastSurface", "Collidable", "Environment" }
+	local Tagged      : { Instance } = {}
+
+	for _, Tag in ipairs(TagPriority) do
+		for _, TaggedInstance in ipairs(CollectionService:GetTagged(Tag)) do
+			table.insert(Tagged, TaggedInstance)
+		end
+	end
+
+	return Tagged
+end
+
+-- Removes stale entries from the message cooldown map (entries older than 60 seconds).
+local function cleanupMessageCooldowns(): ()
+	local CurrentTime = os.time()
+
+	for CooldownKey, Timestamp in MessageCooldowns do
+		if CurrentTime - Timestamp > 60 then
+			MessageCooldowns[CooldownKey] = nil
+		end
+	end
+end
+
+-- Runs the periodic background cleanup, sweeping message cooldowns every 5 minutes.
+local function runBackgroundCleanup(): ()
+	while true do
+		Scheduler.Wait(300)
+		cleanupMessageCooldowns()
+	end
+end
+
+-- Serializer dispatch table mapping Luau/Roblox type names to their serialization functions.
+local Serializers: { [string]: (DataValue: any) -> any } = {
+	["Vector3"] = function(DataValue)
+		local TypeBuffer = buffer.create(12)
+		buffer.writef32(TypeBuffer, 0, DataValue.X)
+		buffer.writef32(TypeBuffer, 4, DataValue.Y)
+		buffer.writef32(TypeBuffer, 8, DataValue.Z)
+		return { __type = "Vector3", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["Vector2"] = function(DataValue)
+		local TypeBuffer = buffer.create(8)
+		buffer.writef32(TypeBuffer, 0, DataValue.X)
+		buffer.writef32(TypeBuffer, 4, DataValue.Y)
+		return { __type = "Vector2", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["Vector3int16"] = function(DataValue)
+		local TypeBuffer = buffer.create(6)
+		buffer.writei16(TypeBuffer, 0, DataValue.X)
+		buffer.writei16(TypeBuffer, 2, DataValue.Y)
+		buffer.writei16(TypeBuffer, 4, DataValue.Z)
+		return { __type = "Vector3int16", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["CFrame"] = function(DataValue)
+		local TypeBuffer               = buffer.create(48)
+		local Pos, RV, UV, LV = DataValue.Position, DataValue.RightVector, DataValue.UpVector, DataValue.LookVector
+		buffer.writef32(TypeBuffer, 0,  Pos.X); buffer.writef32(TypeBuffer, 4,  Pos.Y); buffer.writef32(TypeBuffer, 8,  Pos.Z)
+		buffer.writef32(TypeBuffer, 12, RV.X);  buffer.writef32(TypeBuffer, 16, UV.X);  buffer.writef32(TypeBuffer, 20, -LV.X)
+		buffer.writef32(TypeBuffer, 24, RV.Y);  buffer.writef32(TypeBuffer, 28, UV.Y);  buffer.writef32(TypeBuffer, 32, -LV.Y)
+		buffer.writef32(TypeBuffer, 36, RV.Z);  buffer.writef32(TypeBuffer, 40, UV.Z);  buffer.writef32(TypeBuffer, 44, -LV.Z)
+		return { __type = "CFrame", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["UDim"] = function(DataValue)
+		local TypeBuffer = buffer.create(8)
+		buffer.writef32(TypeBuffer, 0, DataValue.Scale)
+		buffer.writei32(TypeBuffer, 4, DataValue.Offset)
+		return { __type = "UDim", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["UDim2"] = function(DataValue)
+		local TypeBuffer = buffer.create(16)
+		buffer.writef32(TypeBuffer, 0, DataValue.X.Scale); buffer.writei32(TypeBuffer, 4,  DataValue.X.Offset)
+		buffer.writef32(TypeBuffer, 8, DataValue.Y.Scale); buffer.writei32(TypeBuffer, 12, DataValue.Y.Offset)
+		return { __type = "UDim2", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["Rect"] = function(DataValue)
+		local TypeBuffer = buffer.create(16)
+		buffer.writef32(TypeBuffer, 0, DataValue.Min.X); buffer.writef32(TypeBuffer, 4,  DataValue.Min.Y)
+		buffer.writef32(TypeBuffer, 8, DataValue.Max.X); buffer.writef32(TypeBuffer, 12, DataValue.Max.Y)
+		return { __type = "Rect", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["Color3"] = function(DataValue)
+		local TypeBuffer = buffer.create(12)
+		buffer.writef32(TypeBuffer, 0, DataValue.R)
+		buffer.writef32(TypeBuffer, 4, DataValue.G)
+		buffer.writef32(TypeBuffer, 8, DataValue.B)
+		return { __type = "Color3", b64 = encodeBufferToBase64(TypeBuffer) }
+	end,
+	
+	["BrickColor"] = function(DataValue)
+		return { __type = "BrickColor", Name = DataValue.Name }
+	end,
+	
+	["ColorSequence"] = function(DataValue)
+		local SerializedKeypoints = {}
+		for _, Kp in ipairs(DataValue.Keypoints :: { ColorSequenceKeypoint }) do
+			table.insert(SerializedKeypoints, { Time = Kp.Time, Value = { Kp.Value.R, Kp.Value.G, Kp.Value.B } })
+		end
+		return { __type = "ColorSequence", Keypoints = SerializedKeypoints }
+	end,
+	
+	["NumberSequence"] = function(DataValue)
+		local SerializedKeypoints = {}
+		for _, Kp in ipairs(DataValue.Keypoints :: { NumberSequenceKeypoint }) do
+			table.insert(SerializedKeypoints, { Time = Kp.Time, Value = Kp.Value, Envelope = Kp.Envelope })
+		end
+		return { __type = "NumberSequence", Keypoints = SerializedKeypoints }
+	end,
+	
+	["Font"] = function(DataValue)
+		return {
+			__type = "Font",
+			Family = DataValue.Family,
+			Weight = DataValue.Weight.Name,
+			Style  = DataValue.Style.Name,
+		}
+	end,
+	
+	["PhysicalProperties"] = function(DataValue)
+		return {
+			__type           = "PhysicalProperties",
+			Density          = DataValue.Density,
+			Friction         = DataValue.Friction,
+			Elasticity       = DataValue.Elasticity,
+			FrictionWeight   = DataValue.FrictionWeight,
+			ElasticityWeight = DataValue.ElasticityWeight,
+		}
+	end,
+	
+	["RaycastParams"] = function(DataValue)
+		local InstanceNames = {}
+		for _, Inst in ipairs(DataValue.FilterDescendantsInstances or {}) do
+			table.insert(InstanceNames, Inst.Name)
+		end
+		return {
+			__type         = "RaycastParams",
+			FilterType     = DataValue.FilterType.Name,
+			IgnoreWater    = DataValue.IgnoreWater,
+			CollisionGroup = DataValue.CollisionGroup,
+			FilterNames    = InstanceNames,
+		}
+	end,
+	
+	["OverlapParams"] = function(DataValue)
+		local InstanceNames = {}
+		for _, Inst in ipairs(DataValue.FilterDescendantsInstances or {}) do
+			table.insert(InstanceNames, Inst.Name)
+		end
+		return {
+			__type         = "OverlapParams",
+			FilterType     = DataValue.FilterType.Name,
+			MaxParts       = DataValue.MaxParts,
+			CollisionGroup = DataValue.CollisionGroup,
+			FilterNames    = InstanceNames,
+		}
+	end,
+	
+	["PathWaypoint"] = function(DataValue)
+		return {
+			__type   = "PathWaypoint",
+			Position = DependentServices.DeepSerialize(DataValue.Position),
+			Action   = DataValue.Action.Name,
+		}
+	end,
+	
+	["EnumItem"] = function(DataValue)
+		return { __type = "EnumItem", Value = tostring(DataValue) }
+	end,
+	
+	["TweenInfo"] = function(DataValue)
+		return {
+			__type          = "TweenInfo",
+			Time            = DataValue.Time,
+			EasingStyle     = DataValue.EasingStyle.Name,
+			EasingDirection = DataValue.EasingDirection.Name,
+			RepeatCount     = DataValue.RepeatCount,
+			Reverses        = DataValue.Reverses,
+			DelayTime       = DataValue.DelayTime,
+		}
+	end,
+	
+	["DateTime"] = function(DataValue)
+		return { __type = "DateTime", UnixTimestamp = DataValue.UnixTimestamp }
+	end,
+	
+	["Instance"] = function(DataValue)
+		return { __type = "Instance", Name = DataValue.Name, ClassName = DataValue.ClassName }
+	end,
+}
+
+-- Deserializer dispatch table mapping serialized __type tags back to their Luau/Roblox constructors.
+local Deserializers: { [string]: (InputData: any) -> any } = {
+	["Vector3"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return Vector3.new(buffer.readf32(Buf, 0), buffer.readf32(Buf, 4), buffer.readf32(Buf, 8))
+	end,
+	
+	["Vector2"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return Vector2.new(buffer.readf32(Buf, 0), buffer.readf32(Buf, 4))
+	end,
+	
+	["Vector3int16"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return Vector3int16.new(buffer.readi16(Buf, 0), buffer.readi16(Buf, 2), buffer.readi16(Buf, 4))
+	end,
+	
+	["CFrame"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return CFrame.new(
+			buffer.readf32(Buf, 0),  buffer.readf32(Buf, 4),  buffer.readf32(Buf, 8),
+			buffer.readf32(Buf, 12), buffer.readf32(Buf, 16), buffer.readf32(Buf, 20),
+			buffer.readf32(Buf, 24), buffer.readf32(Buf, 28), buffer.readf32(Buf, 32),
+			buffer.readf32(Buf, 36), buffer.readf32(Buf, 40), buffer.readf32(Buf, 44)
+		)
+	end,
+	
+	["UDim"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return UDim.new(buffer.readf32(Buf, 0), buffer.readi32(Buf, 4))
+	end,
+	
+	["UDim2"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return UDim2.new(buffer.readf32(Buf, 0), buffer.readi32(Buf, 4), buffer.readf32(Buf, 8), buffer.readi32(Buf, 12))
+	end,
+	
+	["Rect"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return Rect.new(buffer.readf32(Buf, 0), buffer.readf32(Buf, 4), buffer.readf32(Buf, 8), buffer.readf32(Buf, 12))
+	end,
+	
+	["Color3"] = function(Input)
+		local Buf = decodeBase64ToBuffer(Input.b64)
+		return Color3.new(buffer.readf32(Buf, 0), buffer.readf32(Buf, 4), buffer.readf32(Buf, 8))
+	end,
+	
+	["BrickColor"] = function(Input)
+		return BrickColor.new(Input.Name)
+	end,
+	
+	["ColorSequence"] = function(Input)
+		local Keypoints = {}
+		for _, Kp in ipairs(Input.Keypoints) do
+			table.insert(Keypoints, ColorSequenceKeypoint.new(Kp.Time, Color3.new(Kp.Value[1], Kp.Value[2], Kp.Value[3])))
+		end
+		return ColorSequence.new(Keypoints)
+	end,
+	
+	["NumberSequence"] = function(Input)
+		local Keypoints = {}
+		for _, Kp in ipairs(Input.Keypoints) do
+			table.insert(Keypoints, NumberSequenceKeypoint.new(Kp.Time, Kp.Value, Kp.Envelope))
+		end
+		return NumberSequence.new(Keypoints)
+	end,
+	
+	["Font"] = function(Input)
+		return Font.new(Input.Family, Enum.FontWeight[Input.Weight], Enum.FontStyle[Input.Style])
+	end,
+	
+	["PhysicalProperties"] = function(Input)
+		return PhysicalProperties.new(Input.Density, Input.Friction, Input.Elasticity, Input.FrictionWeight, Input.ElasticityWeight)
+	end,
+	
+	["RaycastParams"] = function(Input)
+		local RayParams = RaycastParams.new()
+		if Input.FilterType then RayParams.FilterType = Enum.RaycastFilterType[Input.FilterType] end
+		RayParams.IgnoreWater    = Input.IgnoreWater
+		RayParams.CollisionGroup = Input.CollisionGroup
+		local Found = findInstancesByNames(Input.FilterNames)
+		RayParams.FilterDescendantsInstances = #Found > 0 and Found or getTaggedInstancesFallback()
+		return RayParams
+	end,
+	
+	["OverlapParams"] = function(Input)
+		local OverParams = OverlapParams.new()
+		if Input.FilterType then OverParams.FilterType = Enum.RaycastFilterType[Input.FilterType] end
+		OverParams.CollisionGroup = Input.CollisionGroup
+		OverParams.MaxParts       = Input.MaxParts
+		local Found = findInstancesByNames(Input.FilterNames)
+		OverParams.FilterDescendantsInstances = #Found > 0 and Found or getTaggedInstancesFallback()
+		return OverParams
+	end,
+	
+	["PathWaypoint"] = function(Input)
+		return PathWaypoint.new(DependentServices.DeepDeserialize(Input.Position), Enum.PathWaypointAction[Input.Action])
+	end,
+	
+	["EnumItem"] = function(Input)
+		local EnumName, ItemName = string.match(Input.Value, "Enum%.(%w+)%.(%w+)")
+		return (EnumName and ItemName and Enum[EnumName]) and (Enum :: any)[EnumName][ItemName] or Input.Value
+	end,
+	
+	["TweenInfo"] = function(Input)
+		return TweenInfo.new(Input.Time, Enum.EasingStyle[Input.EasingStyle], Enum.EasingDirection[Input.EasingDirection], Input.RepeatCount, Input.Reverses, Input.DelayTime)
+	end,
+	
+	["DateTime"] = function(Input)
+		return DateTime.fromUnixTimestamp(Input.UnixTimestamp)
+	end,
+	
+	["Instance"] = function(Input)
+		return string.format("[Instance:%s]", Input.Name or "?")
+	end,
+}
+
+-------------------------------------------------------------------------------------------------------------
+--#########################################################################################################--
+-------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------
+-- DependentServices Background Worker Section
+----------------------------------------------------------
+
+Scheduler.Defer(runBackgroundCleanup)
+
+-------------------------------------------------------------------------------------------------------------
+--#########################################################################################################--
+-------------------------------------------------------------------------------------------------------------
+----------------------------------------------------------
+-- DependentServices Public APIs Section
+----------------------------------------------------------
+
+--[[
+	Recursively serializes any Luau/Roblox value into a DataStore-safe table representation.
+	Supports delta caching when MemoryLocation and UserId are provided.
+
+	Params:
+	    DataValue      : any           -- The value to serialize.
+	    VisitedTables  : VisitedTable? -- Cycle-detection map; pass nil on the first call.
+	    MemoryLocation : string?       -- Cache key component; required to enable delta caching.
+	    UserId         : string?       -- Cache key component; required to enable delta caching.
+
+	Returns:
+	    SerializedValue -- The serialized form safe for DataStore storage.
+]]
+function DependentServices.DeepSerialize(DataValue: any, VisitedTables: VisitedTable?, MemoryLocation: string?, UserId: string?): SerializedValue
+	local Visited   : VisitedTable = VisitedTables or {}
+	local ValueType : string       = typeof(DataValue)
+
+	if DataValue == nil then
+		return nil :: any
+	end
+
+	if ValueType == "string" or ValueType == "number" or ValueType == "boolean" then
+		return DataValue
+	end
+
+	if ValueType == "table" then
+		if Visited[DataValue] then
+			return nil :: any
+		end
+		Visited[DataValue] = true
+
+		if MemoryLocation and UserId then
+			local CacheKey   = generateCacheKey(MemoryLocation, UserId)
+			local CacheEntry = SerializationCacheStore[CacheKey]
+
+			if CacheEntry and CacheEntry.cachedData and CacheEntry.serializedData then
+				local Delta: DeltaChanges = detectChangedFields(DataValue, CacheEntry.cachedData, nil)
+
+				if Delta == nil then
+					return CacheEntry.serializedData :: any
+				end
+
+				local SerializedDelta: DataTable = {}
+
+				for ChangeKey: any, ChangeValue: any in Delta do
+					SerializedDelta[ChangeKey] = DependentServices.DeepSerialize(ChangeValue, Visited)
+				end
+
+				recursiveReleaseToPool(Delta)
+
+				local NewSerializedState = table.clone(CacheEntry.serializedData)
+
+				local function applyDelta(Target: any, DeltaTable: any): ()
+					for Key, Value in DeltaTable do
+						if Value == "__DELETED__" then
+							Target[Key] = nil
+						elseif typeof(Value) == "table" and typeof(Target[Key]) == "table" and Value.__type == nil then
+							applyDelta(Target[Key], Value)
+						else
+							Target[Key] = Value
+						end
+					end
+				end
+
+				applyDelta(NewSerializedState, SerializedDelta)
+
+				SerializationCacheStore[CacheKey] = {
+					cachedData     = deepCloneForCache(DataValue) :: DataTable,
+					serializedData = NewSerializedState,
+				}
+
+				return NewSerializedState :: any
+			else
+				local FullSerialized: DataTable = {}
+
+				for Key: any, Value: any in DataValue do
+					if IGNORED_KEYS[Key :: string] then
+						continue
+					end
+					FullSerialized[Key] = DependentServices.DeepSerialize(Value, Visited)
+				end
+
+				SerializationCacheStore[CacheKey] = {
+					cachedData     = deepCloneForCache(DataValue) :: DataTable,
+					serializedData = FullSerialized,
+				}
+				CacheCount += 1
+
+				return FullSerialized :: any
+			end
+		end
+
+		local SerializedTable: DataTable = {}
+
+		for Key: any, Value: any in DataValue do
+			if IGNORED_KEYS[Key :: string] then
+				continue
+			end
+			SerializedTable[Key] = DependentServices.DeepSerialize(Value, Visited)
+		end
+
+		return SerializedTable :: any
+	end
+
+	local SerializerFunc = Serializers[ValueType]
+
+	if SerializerFunc then
+		return SerializerFunc(DataValue) :: any
+	end
+
+	warn(string.format("[Serializer] Unsupported type: %s", ValueType))
+	return tostring(DataValue) :: any
+end
+
+--[[
+Removes serialization cache entries for a specific player, optionally scoped to one memory location.
+
+Params:
+    UserId         : string  -- The player's UserId as a string.
+    MemoryLocation : string? -- If provided, clears only the entry for this location.
+]]
+function DependentServices.ClearSerializationCache(UserId: string, MemoryLocation: string?): ()
+	local UserIdSuffix = "_" .. UserId
+	if MemoryLocation then
+		local CacheKey = generateCacheKey(MemoryLocation, UserId)
+		if SerializationCacheStore[CacheKey] then
+			SerializationCacheStore[CacheKey] = nil
+			CacheCount                       -= 1
+		end
+	else
+		for CacheKey in SerializationCacheStore do
+			if string.sub(CacheKey, -#UserIdSuffix) == UserIdSuffix then
+				SerializationCacheStore[CacheKey] = nil
+				CacheCount                       -= 1
+			end
+		end
+	end
+end
+
+--[[
+Recursively deserializes a value produced by DeepSerialize back into its original Luau/Roblox type.
+
+Params:
+    InputData : SerializedValue -- The serialized value to reconstruct.
+
+Returns:
+    any -- The reconstructed Luau/Roblox value.
+]]
+function DependentServices.DeepDeserialize(InputData: SerializedValue): any
+	if typeof(InputData) ~= "table" then
+		return InputData
+	end
+
+	local TypeMetadata: string? = (InputData :: any).__type
+
+	if not TypeMetadata then
+		local DeserializedTable: DataTable = {}
+		for Key: any, Value: any in InputData :: DataTable do
+			DeserializedTable[Key] = DependentServices.DeepDeserialize(Value)
+		end
+		return DeserializedTable
+	end
+
+	local DeserializerFunc = Deserializers[TypeMetadata]
+
+	if DeserializerFunc then
+		return DeserializerFunc(InputData)
+	end
+
+	return InputData
+end
+
+--[[
+	Returns the current number of active serialization cache entries.
+
+	Returns:
+	    number -- Total live cache entry count.
+]]
+function DependentServices.GetSerializationCacheSize(): number
+	return CacheCount
+end
+
+--[[
+	Injects an external library within the Lazy Games Suite of Tools environment.
+	Currently supports the "Assignment" library.
+
+	Params:
+	    ModuleName        : string -- The name of the ModuleScript file.
+	    ModuleTableObject : any    -- The module table to inject.
+
+	Returns:
+	    nil
+]]
+function DependentServices.Inject(ModuleName: string, ModuleTableObject: any): ()
+	if typeof(ModuleName) ~= "string" or ModuleName == "" then
+		error("[DependentServices] Inject Error: 'ModuleName' must be a non-empty string.")
+	end
+	if typeof(ModuleTableObject) ~= "table" then
+		error("[DependentServices] Inject Error: 'ModuleTableObject' must be a table.")
+	end
+
+	if ModuleName == "Assignment" then
+		local Module     = ModuleTableObject
+		Scheduler.Spawn  = function(...) return Module.Spawn(...)  end
+		Scheduler.Defer  = function(...) return Module.Defer(...)  end
+		Scheduler.Delay  = function(...) return Module.Delay(...)  end
+		Scheduler.Wait   = function(...) return Module.Wait(...)   end
+		Scheduler.Cancel = function(...) return Module.Cancel(...) end
+	end
+end
+
+return DependentServices
