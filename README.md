@@ -1,50 +1,62 @@
-# The Diary Framework: Architectural Overview
-Diary is a Cache-First, Session-Locked Hybrid Persistence Framework designed specifically for high-capacity (200+ player) Roblox MMORPGs. Its primary architectural goal is to completely decouple real-time gameplay logic from the latency and rate limits of Roblox's native DataStoreService.
+# Assignment
 
-To achieve this, Diary relies on a sophisticated hierarchy of active server memory, transient MemoryStore caching, and resilient background batching.
+**Type:** Singleton Library  
+_A task scheduling library for Roblox that gives every scheduled call a cancellation handle, throttles heavy workloads automatically, and ensures pending work survives server shutdown._
 
-## The Core Philosophy: Read Instantly, Save Asynchronously
-In a traditional Roblox game, developers often yield the server to read or write data. In an MMO, yielding during combat or trading is unacceptable.
+---
 
-Diary solves this by enforcing a Read-Reference, Mutate, and Mark pattern:
+## Overview
 
-### 1. When a player joins, their complete data profile is hydrated into local server RAM (PlayerDataCache).
+Assignment is a drop-in replacement for Roblox's native `task` library. It exposes the same operations — `Spawn`, `Defer`, `Delay`, `Wait`, and `Repeat` — but adds two things the native library does not provide: first-class cancellation on every scheduled call, and a safe shutdown pathway that preserves in-flight work when a server closes.
 
-### 2. Gameplay systems (combat, inventory) read and modify this RAM directly with zero latency.
+The library's functions are split into two families that serve different purposes.
 
-### 3. Systems call Diary.MarkDirty() to flag changes. Background workers autonomously bundle these changes and push them to the database, ensuring the main gameplay thread never stalls.
+The **Pooled Family** (`Spawn`, `Defer`, `Delay`) is designed to protect your server. These functions share a pool of reusable threads, throttle large backlogs automatically to prevent frame spikes, recycle memory between calls, and silently discard work that has been cancelled before it runs.
 
-## The Four Pillars of the Architecture
-The framework is divided into four highly specialized, decoupled modules:
+The **Isolated Family** (`SpawnIsolated`, `DeferIsolated`, `DelayIsolated`) is designed for absolute control. These functions bypass the shared pool and run their work in a dedicated engine-managed thread. They give you a `thread` reference you can cancel at any time, skip all throttling so the engine prioritises your logic immediately, and are the right tool for work that will sleep for a long time or involve repeated slow yields.
 
-### 1. Diary.lua (The Orchestrator)
-This is the central nervous system and the primary developer-facing API.
+---
 
-#### * Lifecycle Management: It safely handles player connections, disconnections, and server shutdowns, ensuring no data is dropped when the server closes.
+## External Dependencies
 
-#### * Template Reconciliation: It ensures player data always matches the latest game schemas, automatically injecting missing keys or scrubbing deprecated ones.
+**RunService** — Drives the scheduler's per-frame tick. Required at load time. No other external dependencies.
 
-#### * Cross-Server Handshakes: It uses MessagingService to communicate with other servers during "crash-joins", demanding old servers release their locks before letting a player load in.
+---
 
-## 2. MemoryStore.lua (The Locksmith & Fast Cache)
-This module handles distributed locking and high-frequency, volatile data.
+## Key Features
 
-#### * Session Leasing: To prevent data duplication or wiping, this module grants a strict "Lease" to a specific Server ID. A server cannot save player data unless it exclusively owns this lease.
+### The Pooled Family — Safety and Efficiency
 
-#### * Transient Storage: It acts as a fast cache for global MMO features, such as tracking "Online/Offline" status and saving HumanoidDescription data for "Ghost" bodies left behind after logouts.
+Think of the pooled family like a staffing agency with one available worker. When you call `Spawn`, `Defer`, or `Delay`, you hand a job to that worker. The moment the job finishes the worker is immediately available for the next one. Because the same worker is reused for every short job, there is no overhead from hiring a new one each time.
 
-## 3. DataStore.lua (The Resilient Pipeline)
-This is the permanent storage engine, built to survive Roblox's strict API rate limits.
+If the worker is busy when a new job arrives — because a previous job is sleeping mid-yield — the agency hires a temporary replacement just for that job. This is fine for brief yields, but if the worker stays busy for a long time (for example, sleeping for 30 seconds waiting on a DataStore), many temporary replacements accumulate and start to cost real memory. That is the signal to use an Isolated variant instead.
 
-#### * Smart Queueing: Instead of saving instantly, requests are routed into a SaveQueue. A background processor drains this queue in controlled batches of up to 10 operations, utilizing exponential backoff if a save fails.
+The pooled family also throttles deferred work automatically. If many jobs are queued in the same frame, Assignment spreads them across several frames rather than processing everything at once, keeping frame times stable.
 
-#### * Hybrid Saving: It intelligently chooses between SetAsync (for direct overwrites if the server owns the lease) and UpdateAsync (for merging data if there is a conflict).
+### The Isolated Family — Absolute Control
 
-## 4. DependentServices.lua (The Optimizer)
-This module acts as the mathematical and memory-optimization engine.
+The isolated family bypasses the shared pool entirely and hands work straight to the engine. Each isolated call gets its own dedicated thread, like hiring a specialist who works completely independently of your regular staff.
 
-#### * Binary Serialization: It takes expensive 3D datatypes (Vector3, CFrame, ColorSequence) and compresses them into raw byte buffers, encoding them in Base64. This drastically reduces the size of the DataStore payload.
+Use isolated variants when work will sleep for a meaningful amount of time — DataStore calls, HTTP requests, loops with multi-second intervals. Keeping that kind of work out of the shared pool means short jobs always find a free worker waiting for them.
 
-#### * Delta Generation: Before saving, it compares the current data against a cached snapshot to generate a "Delta" map, ensuring the server only writes the exact variables that changed.
+Isolated calls return a raw `thread` reference rather than a `Handle`. You can stop that thread at any time by passing it to `Assignment.Cancel`.
 
-#### * Memory Pooling: It heavily utilizes table pooling to recycle arrays and dictionaries, preventing the Luau Garbage Collector from freezing the server during massive serialization events.
+### Cancellable Handles
+
+Every call in the pooled family returns a `Handle`. Call `Handle:Break()` before the work runs and Assignment will silently skip and discard it — no errors, no side effects. The cancellation check happens at the moment the scheduled time arrives, so calling `Break` at any point up until then is guaranteed to stop execution.
+
+For isolated threads, pass the returned `thread` to `Assignment.Cancel` for the same effect.
+
+### Smart Wait — Works Anywhere
+
+`Assignment.Wait` is context-aware. In a pooled thread it pauses execution entirely within Assignment's scheduling and wakes the thread at the right time. In an isolated thread it defers to the engine's own wait mechanism. You never need to choose between the two — use `Assignment.Wait` everywhere and the right behaviour happens automatically.
+
+Passing zero, `nil`, or a negative value to `Wait` is valid and means "pause for the shortest possible time" — the thread yields just until the next frame and then continues.
+
+### Graceful Server Shutdown
+
+When a server closes, Assignment automatically hands all pending scheduled work to the engine's native scheduler with each task's remaining time intact. Nothing in flight is lost. This happens automatically and requires no code on your part.
+
+### Periodic Cleanup
+
+Assignment periodically scans all scheduled work and quietly discards anything that has been cancelled but has not yet reached its scheduled time. This ensures that cancelled-but-waiting tasks do not accumulate in memory over a long server session.
