@@ -1,0 +1,96 @@
+/* Override the main top header */
+.md-header {
+  background: linear-gradient(to right, #111111, #444444) !important;
+}
+
+/* Override the tabs bar to match the gradient */
+.md-tabs {
+  background: linear-gradient(to right, #111111, #444444) !important;
+}
+
+/* Make sure the text and icons stay bright white for contrast */
+.md-header__button, 
+.md-header__title, 
+.md-tabs__link {
+  color: #ffffff !important;
+}
+
+/* Nuclear Override for Sidebar Section Headers */
+.md-sidebar--primary .md-nav__item--section > .md-nav__title,
+.md-sidebar--primary .md-nav__item--section > label,
+.md-sidebar--primary .md-nav__item--section > span {
+  font-size: 1.15rem !important;         
+  font-weight: 800 !important;           
+  font-family: "Trebuchet MS", sans-serif !important; 
+  text-decoration: underline !important; 
+  text-underline-offset: 5px !important; 
+  color: #ffffff !important;             
+  letter-spacing: 1px !important;        
+  text-transform: uppercase !important;
+}
+
+/* Nuclear Override for Sidebar Section Headers */
+.md-sidebar--primary .md-nav__item--section:nth-of-type(1) > .md-nav__title,
+.md-sidebar--primary .md-nav__item--section:nth-of-type(1) > label,
+.md-sidebar--primary .md-nav__item--section:nth-of-type(1) > span {
+  display: none !important;
+}
+
+/* Widen the entire page grid to give tables more room and push the TOC right */
+.md-grid {
+  max-width: 1600px !important; 
+}
+
+
+/* Override the main top header */
+.md-header {
+  background: linear-gradient(to right, #111111, #444444) !important;
+}
+
+/* Override the tabs bar to match the gradient */
+.md-tabs {
+  background: linear-gradient(to right, #111111, #444444) !important;
+}
+
+/* Make sure the text and icons stay bright white for contrast */
+.md-header__button, 
+.md-header__title, 
+.md-tabs__link {
+  color: #ffffff !important;
+}
+
+/* Nuclear Override for Sidebar Section Headers */
+.md-sidebar--primary .md-nav__item--section > .md-nav__title,
+.md-sidebar--primary .md-nav__item--section > label,
+.md-sidebar--primary .md-nav__item--section > span {
+  font-size: 1.15rem !important;         
+  font-weight: 800 !important;           
+  font-family: "Trebuchet MS", sans-serif !important; 
+  text-decoration: underline !important; 
+  text-underline-offset: 5px !important; 
+  color: #ffffff !important;             
+  letter-spacing: 1px !important;        
+  text-transform: uppercase !important;
+}
+
+/* Nuclear Override for Sidebar Section Headers */
+.md-sidebar--primary .md-nav__item--section:nth-of-type(1) > .md-nav__title,
+.md-sidebar--primary .md-nav__item--section:nth-of-type(1) > label,
+.md-sidebar--primary .md-nav__item--section:nth-of-type(1) > span {
+  display: none !important;
+}
+
+/* Widen the entire page grid to give tables more room and push the TOC right */
+.md-grid {
+  max-width: 1600px !important; 
+}
+
+/* 1. Target the logo specifically */
+.md-logo {
+  margin-right: 0.2rem !important;
+}
+
+/* 3. Ensure the title has no extra left padding pushing it away */
+.md-header__title {
+  margin-left: 0 !important;
+}
